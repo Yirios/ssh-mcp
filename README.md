@@ -161,8 +161,8 @@ claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=192.168.1.1
 Create one `.env` file per target. The file name without `.env` becomes the profile name:
 
 ```bash
-# /path/to/ssh-profiles/test-centos8-root.env
-SSH_MCP_HOST=192.168.1.2
+# /path/to/ssh-profiles/test.env
+SSH_MCP_HOST=192.168.1.100
 SSH_MCP_PORT=22
 SSH_MCP_USER=root
 SSH_MCP_PASSWORD=your_password
