@@ -5,6 +5,8 @@ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { Client, ClientChannel } from 'ssh2';
 import { z } from 'zod';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { readFileSync, readdirSync, statSync } from 'fs';
+import path from 'path';
 
 // Example usage: node build/index.js --host=1.2.3.4 --port=22 --user=root --password=pass --key=path/to/key --timeout=5000 --disableSudo
 function parseArgv() {
@@ -36,6 +38,8 @@ const SUPASSWORD = argvConfig.suPassword;
 const SUDOPASSWORD = argvConfig.sudoPassword;
 const DISABLE_SUDO = argvConfig.disableSudo !== undefined;
 const KEY = argvConfig.key;
+const PROFILES_FILE = argvConfig.profiles || process.env.SSH_MCP_PROFILES;
+const PROFILES_DIR = argvConfig.profilesDir || process.env.SSH_MCP_PROFILES_DIR;
 const DEFAULT_TIMEOUT = argvConfig.timeout ? parseInt(argvConfig.timeout) : 60000; // 60 seconds default timeout
 // Max characters configuration:
 // - Default: 1000 characters
@@ -58,8 +62,9 @@ const MAX_CHARS = (() => {
 
 function validateConfig(config: Record<string, string | null>) {
   const errors = [];
-  if (!config.host) errors.push('Missing required --host');
-  if (!config.user) errors.push('Missing required --user');
+  const hasProfiles = Boolean(config.profiles || config.profilesDir || process.env.SSH_MCP_PROFILES || process.env.SSH_MCP_PROFILES_DIR);
+  if (!hasProfiles && !config.host) errors.push('Missing required --host');
+  if (!hasProfiles && !config.user) errors.push('Missing required --user');
   if (config.port && isNaN(Number(config.port))) errors.push('Invalid --port');
   if (errors.length > 0) {
     throw new Error('Configuration error:\n' + errors.join('\n'));
@@ -114,6 +119,176 @@ export interface SSHConfig {
   privateKey?: string;
   suPassword?: string;
   sudoPassword?: string;  // Password for sudo commands specifically (if different from suPassword)
+}
+
+export interface SSHProfile extends SSHConfig {
+  name: string;
+  keyPath?: string;
+}
+
+function parseEnvFile(content: string): Record<string, string> {
+  const parsed: Record<string, string> = {};
+  for (const rawLine of content.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+    const equalIndex = line.indexOf('=');
+    if (equalIndex === -1) continue;
+    const key = line.slice(0, equalIndex).trim();
+    let value = line.slice(equalIndex + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    parsed[key] = value;
+  }
+  return parsed;
+}
+
+function profileFromEnv(name: string, env: Record<string, string>): SSHProfile {
+  const host = env.SSH_MCP_HOST || env.HOST;
+  const username = env.SSH_MCP_USER || env.SSH_MCP_USERNAME || env.USER;
+  if (!host) {
+    throw new Error(`Profile "${name}" is missing SSH_MCP_HOST`);
+  }
+  if (!username) {
+    throw new Error(`Profile "${name}" is missing SSH_MCP_USER`);
+  }
+
+  const profile: SSHProfile = {
+    name,
+    host,
+    port: Number(env.SSH_MCP_PORT || env.PORT || 22),
+    username,
+  };
+
+  const password = sanitizePassword(env.SSH_MCP_PASSWORD || env.PASSWORD);
+  const suPassword = sanitizePassword(env.SSH_MCP_SU_PASSWORD || env.SSH_MCP_SUPASSWORD || env.SU_PASSWORD);
+  const sudoPassword = sanitizePassword(env.SSH_MCP_SUDO_PASSWORD || env.SSH_MCP_SUDOPASSWORD || env.SUDO_PASSWORD);
+  const keyPath = env.SSH_MCP_KEY || env.SSH_MCP_KEY_PATH || env.KEY;
+
+  if (password) profile.password = password;
+  if (suPassword) profile.suPassword = suPassword;
+  if (sudoPassword) profile.sudoPassword = sudoPassword;
+  if (keyPath) profile.keyPath = keyPath;
+
+  return profile;
+}
+
+function profileFromObject(name: string, value: any): SSHProfile {
+  const host = value.host || value.SSH_MCP_HOST;
+  const username = value.user || value.username || value.SSH_MCP_USER || value.SSH_MCP_USERNAME;
+  if (!host) {
+    throw new Error(`Profile "${name}" is missing host`);
+  }
+  if (!username) {
+    throw new Error(`Profile "${name}" is missing user`);
+  }
+
+  const profile: SSHProfile = {
+    name,
+    host,
+    port: Number(value.port || value.SSH_MCP_PORT || 22),
+    username,
+  };
+
+  const password = sanitizePassword(value.password || value.SSH_MCP_PASSWORD);
+  const suPassword = sanitizePassword(value.suPassword || value.SSH_MCP_SU_PASSWORD || value.SSH_MCP_SUPASSWORD);
+  const sudoPassword = sanitizePassword(value.sudoPassword || value.SSH_MCP_SUDO_PASSWORD || value.SSH_MCP_SUDOPASSWORD);
+  const keyPath = value.key || value.keyPath || value.SSH_MCP_KEY || value.SSH_MCP_KEY_PATH;
+
+  if (password) profile.password = password;
+  if (suPassword) profile.suPassword = suPassword;
+  if (sudoPassword) profile.sudoPassword = sudoPassword;
+  if (keyPath) profile.keyPath = keyPath;
+
+  return profile;
+}
+
+function loadProfiles(): Map<string, SSHProfile> {
+  const profiles = new Map<string, SSHProfile>();
+
+  if (PROFILES_FILE) {
+    const raw = readFileSync(PROFILES_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    const profileValues = parsed.profiles || parsed;
+    for (const [name, value] of Object.entries(profileValues)) {
+      profiles.set(name, profileFromObject(name, value));
+    }
+  }
+
+  if (PROFILES_DIR) {
+    for (const entry of readdirSync(PROFILES_DIR)) {
+      if (!entry.endsWith('.env')) continue;
+      const fullPath = path.join(PROFILES_DIR, entry);
+      if (!statSync(fullPath).isFile()) continue;
+      const name = entry.slice(0, -'.env'.length);
+      profiles.set(name, profileFromEnv(name, parseEnvFile(readFileSync(fullPath, 'utf8'))));
+    }
+  }
+
+  if (profiles.size === 0 && HOST && USER) {
+    const profile: SSHProfile = {
+      name: 'default',
+      host: HOST,
+      port: PORT,
+      username: USER,
+    };
+    if (PASSWORD) profile.password = PASSWORD;
+    if (KEY) profile.keyPath = KEY;
+    if (SUPASSWORD !== null && SUPASSWORD !== undefined) {
+      profile.suPassword = sanitizePassword(SUPASSWORD);
+    }
+    if (SUDOPASSWORD !== null && SUDOPASSWORD !== undefined) {
+      profile.sudoPassword = sanitizePassword(SUDOPASSWORD);
+    }
+    profiles.set(profile.name, profile);
+  }
+
+  return profiles;
+}
+
+const profiles = loadProfiles();
+
+function resolveProfileName(requested?: string): string {
+  if (requested) {
+    if (!profiles.has(requested)) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `Unknown profile "${requested}". Available profiles: ${Array.from(profiles.keys()).join(', ')}`
+      );
+    }
+    return requested;
+  }
+
+  if (profiles.size === 1) {
+    const first = profiles.keys().next().value;
+    if (first) return first;
+  }
+
+  throw new McpError(
+    ErrorCode.InvalidParams,
+    `Multiple SSH profiles are configured. Pass one of: ${Array.from(profiles.keys()).join(', ')}`
+  );
+}
+
+async function buildSshConfig(profile: SSHProfile): Promise<SSHConfig> {
+  const sshConfig: SSHConfig = {
+    host: profile.host,
+    port: profile.port || 22,
+    username: profile.username,
+  };
+
+  if (profile.password) {
+    sshConfig.password = profile.password;
+  } else if (profile.keyPath) {
+    sshConfig.privateKey = readFileSync(profile.keyPath, 'utf8');
+  } else if (profile.privateKey) {
+    sshConfig.privateKey = profile.privateKey;
+  }
+
+  if (profile.suPassword) sshConfig.suPassword = profile.suPassword;
+  if (profile.sudoPassword) sshConfig.sudoPassword = profile.sudoPassword;
+
+  return sshConfig;
 }
 
 export class SSHConnectionManager {
@@ -336,81 +511,79 @@ export class SSHConnectionManager {
   }
 }
 
-let connectionManager: SSHConnectionManager | null = null;
+const connectionManagers = new Map<string, SSHConnectionManager>();
+
+async function getConnectionManager(profileName?: string): Promise<SSHConnectionManager> {
+  const resolvedName = resolveProfileName(profileName);
+  const existing = connectionManagers.get(resolvedName);
+  if (existing) return existing;
+
+  const profile = profiles.get(resolvedName);
+  if (!profile) {
+    throw new McpError(ErrorCode.InvalidParams, `Unknown profile "${resolvedName}"`);
+  }
+
+  const manager = new SSHConnectionManager(await buildSshConfig(profile));
+  connectionManagers.set(resolvedName, manager);
+  return manager;
+}
 
 const server = new McpServer({
   name: 'SSH MCP Server',
   version: '1.5.0',
-  capabilities: {
-    resources: {},
-    tools: {},
-  },
 });
 
-server.tool(
-  "exec",
-  "Execute a shell command on the remote SSH server and return the output.",
+server.registerTool(
+  "list-profiles",
   {
-    command: z.string().describe("Shell command to execute on the remote SSH server"),
-    description: z.string().optional().describe("Optional description of what this command will do"),
+    description: "List configured SSH profiles that can be used with exec or sudo-exec.",
+    inputSchema: {},
   },
-  async ({ command, description }) => {
-    // Sanitize command input
+  async () => ({
+    content: [{
+      type: 'text',
+      text: Array.from(profiles.values())
+        .map((profile) => `${profile.name}\t${profile.username}@${profile.host}:${profile.port || 22}`)
+        .join('\n') + (profiles.size ? '\n' : ''),
+    }],
+  })
+);
+
+server.registerTool(
+  "exec",
+  {
+    description: "Execute a shell command on a configured SSH profile and return the output.",
+    inputSchema: {
+      command: z.string().describe("Shell command to execute on the remote SSH server"),
+      profile: z.string().optional().describe("SSH profile name. Required when multiple profiles are configured"),
+      description: z.string().optional().describe("Optional description of what this command will do"),
+    },
+  },
+  async ({ command, profile, description }) => {
     const sanitizedCommand = sanitizeCommand(command);
 
     try {
-      // Initialize connection manager if not already done
-      if (!connectionManager) {
-        if (!HOST || !USER) {
-          throw new McpError(ErrorCode.InvalidParams, 'Missing required host or username');
-        }
-        const sshConfig: SSHConfig = {
-          host: HOST,
-          port: PORT,
-          username: USER,
-        };
+      const manager = await getConnectionManager(profile);
+      await manager.ensureConnected();
 
-        if (PASSWORD) {
-          sshConfig.password = PASSWORD;
-        } else if (KEY) {
-          const fs = await import('fs/promises');
-          sshConfig.privateKey = await fs.readFile(KEY, 'utf8');
-        }
-
-        if (SUPASSWORD !== null && SUPASSWORD !== undefined) {
-          sshConfig.suPassword = sanitizePassword(SUPASSWORD);
-        }
-        connectionManager = new SSHConnectionManager(sshConfig);
-      }
-
-      // Ensure connection is active (reconnect if needed)
-      await connectionManager.ensureConnected();
-
-      // If a suPassword was provided, explicitly wait for elevation before executing.
-      // This is critical: ensureElevated is idempotent and will return immediately if
-      // already elevated, so this ensures we have a su shell before we try to use it.
-      if ((connectionManager as any).getSuPassword && (connectionManager as any).getSuPassword()) {
+      if ((manager as any).getSuPassword && (manager as any).getSuPassword()) {
         try {
-          const elevationPromise = (connectionManager as any).ensureElevated();
-          // Add a short timeout for elevation to complete
+          const elevationPromise = (manager as any).ensureElevated();
           await Promise.race([
             elevationPromise,
             new Promise((_, reject) => setTimeout(() => reject(new Error('Elevation timeout')), 5000))
           ]);
         } catch (err) {
-          // Log but don't fail; fall back to non-elevated execution if elevation times out
+          // Fall back to non-elevated execution if elevation times out.
         }
       }
 
-      // Append description as comment if provided
       const commandWithDescription = description
         ? `${sanitizedCommand} # ${description.replace(/#/g, '\\#')}`
         : sanitizedCommand;
 
-      const result = await execSshCommandWithConnection(connectionManager, commandWithDescription);
-      return result;
+      return await execSshCommandWithConnection(manager, commandWithDescription);
     } catch (err: any) {
-      // Wrap unexpected errors
       if (err instanceof McpError) throw err;
       throw new McpError(ErrorCode.InternalError, `Unexpected error: ${err?.message || err}`);
     }
@@ -419,75 +592,38 @@ server.tool(
 
 // Expose sudo-exec tool unless explicitly disabled
 if (!DISABLE_SUDO) {
-  server.tool(
+  server.registerTool(
     "sudo-exec",
-    "Execute a shell command on the remote SSH server using sudo. Will use sudo password if provided, otherwise assumes passwordless sudo.",
     {
-      command: z.string().describe("Shell command to execute with sudo on the remote SSH server"),
-      description: z.string().optional().describe("Optional description of what this command will do"),
+      description: "Execute a shell command on a configured SSH profile using sudo. Will use sudo password if provided, otherwise assumes passwordless sudo.",
+      inputSchema: {
+        command: z.string().describe("Shell command to execute with sudo on the remote SSH server"),
+        profile: z.string().optional().describe("SSH profile name. Required when multiple profiles are configured"),
+        description: z.string().optional().describe("Optional description of what this command will do"),
+      },
     },
-    async ({ command, description }) => {
+    async ({ command, profile, description }) => {
       const sanitizedCommand = sanitizeCommand(command);
 
       try {
-        if (!connectionManager) {
-          if (!HOST || !USER) {
-            throw new McpError(ErrorCode.InvalidParams, 'Missing required host or username');
-          }
-
-          const sshConfig: SSHConfig = {
-            host: HOST,
-            port: PORT || 22,
-            username: USER,
-          };
-          if (PASSWORD) {
-            sshConfig.password = PASSWORD;
-          } else if (KEY) {
-            const fs = await import('fs/promises');
-            sshConfig.privateKey = await fs.readFile(KEY, 'utf8');
-          }
-          if (SUPASSWORD !== null && SUPASSWORD !== undefined) {
-            sshConfig.suPassword = sanitizePassword(SUPASSWORD);
-          }
-          if (SUDOPASSWORD !== null && SUDOPASSWORD !== undefined) {
-            sshConfig.sudoPassword = sanitizePassword(SUDOPASSWORD);
-          }
-          connectionManager = new SSHConnectionManager(sshConfig);
-        }
-
-        await connectionManager.ensureConnected();
-
-        // If suPassword or sudoPassword were provided on this call but the
-        // existing connection manager was created earlier without them,
-        // update the manager's values so the subsequent sudo-exec call uses
-        // the latest passwords.
-        if (SUPASSWORD !== null && SUPASSWORD !== undefined) {
-          await connectionManager.setSuPassword(sanitizePassword(SUPASSWORD));
-        }
-        if (SUDOPASSWORD !== null && SUDOPASSWORD !== undefined) {
-          // update sudoPassword on the manager instance
-          (connectionManager as any).sshConfig = { ...(connectionManager as any).sshConfig, sudoPassword: sanitizePassword(SUDOPASSWORD) };
-        }
+        const manager = await getConnectionManager(profile);
+        await manager.ensureConnected();
 
         let wrapped: string;
-        const sudoPassword = connectionManager.getSudoPassword();
+        const sudoPassword = manager.getSudoPassword();
 
-        // Append description as comment if provided
         const commandWithDescription = description
           ? `${sanitizedCommand} # ${description.replace(/#/g, '\\#')}`
           : sanitizedCommand;
 
         if (!sudoPassword) {
-          // No password provided, use -n to fail if sudo requires a password
           wrapped = `sudo -n sh -c '${commandWithDescription.replace(/'/g, "'\\''")}'`;
         } else {
-          // Password provided — pipe it into sudo using printf. This avoids complex
-          // PTY/stdin handling on the SSH channel and is simpler and more reliable.
           const pwdEscaped = sudoPassword.replace(/'/g, "'\\''");
           wrapped = `printf '%s\\n' '${pwdEscaped}' | sudo -p "" -S sh -c '${commandWithDescription.replace(/'/g, "'\\''")}'`;
         }
 
-        return await execSshCommandWithConnection(connectionManager, wrapped);
+        return await execSshCommandWithConnection(manager, wrapped);
       } catch (err: any) {
         if (err instanceof McpError) throw err;
         throw new McpError(ErrorCode.InternalError, `Unexpected error: ${err?.message || err}`);
@@ -700,18 +836,18 @@ async function main() {
   // Handle graceful shutdown
   const cleanup = () => {
     console.error("Shutting down SSH MCP Server...");
-    if (connectionManager) {
-      connectionManager.close();
-      connectionManager = null;
+    for (const manager of connectionManagers.values()) {
+      manager.close();
     }
+    connectionManagers.clear();
     process.exit(0);
   };
 
   process.on('SIGINT', cleanup);
   process.on('SIGTERM', cleanup);
   process.on('exit', () => {
-    if (connectionManager) {
-      connectionManager.close();
+    for (const manager of connectionManagers.values()) {
+      manager.close();
     }
   });
 }
@@ -728,8 +864,8 @@ if (isTestMode) {
 else if (isCliEnabled) {
   main().catch((error) => {
     console.error("Fatal error in main():", error);
-    if (connectionManager) {
-      connectionManager.close();
+    for (const manager of connectionManagers.values()) {
+      manager.close();
     }
     process.exit(1);
   });

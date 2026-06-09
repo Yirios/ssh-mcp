@@ -137,3 +137,6 @@ dist
 
 # Ignore build output
 build/
+
+# Local SSH MCP profile configs
+profiles/

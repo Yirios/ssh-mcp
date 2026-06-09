@@ -15,13 +15,19 @@
 
 ## Contents
 
-- [Quick Start](#quick-start)
-- [Features](#features)
-- [Installation](#installation)
-- [Client Setup](#client-setup)
-- [Testing](#testing)
-- [Disclaimer](#disclaimer)
-- [Support](#support)
+- [SSH MCP Server](#ssh-mcp-server)
+  - [Contents](#contents)
+  - [Quick Start](#quick-start)
+  - [Features](#features)
+    - [Tools](#tools)
+  - [Installation](#installation)
+  - [Client Setup](#client-setup)
+    - [Claude Code](#claude-code)
+  - [Testing](#testing)
+  - [Disclaimer](#disclaimer)
+  - [Contributing](#contributing)
+  - [Code of Conduct](#code-of-conduct)
+  - [Support](#support)
 
 ## Quick Start
 
@@ -149,6 +155,27 @@ claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=192.168.1.1
 ```bash
 claude mcp add --transport stdio ssh-mcp -- npx -y ssh-mcp -- --host=192.168.1.100 --user=admin --password=your_password --sudoPassword=sudo_pass --suPassword=root_pass
 ```
+
+**With Multiple SSH Profiles:**
+
+Create one `.env` file per target. The file name without `.env` becomes the profile name:
+
+```bash
+# /path/to/ssh-profiles/test-centos8-root.env
+SSH_MCP_HOST=192.168.1.2
+SSH_MCP_PORT=22
+SSH_MCP_USER=root
+SSH_MCP_PASSWORD=your_password
+SSH_MCP_TIMEOUT=10000
+```
+
+Start one MCP server with the whole directory:
+
+```bash
+node build/index.js --profilesDir=/path/to/ssh-profiles --timeout=10000
+```
+
+Then pass `profile` when calling `exec` or `sudo-exec`. Use `list-profiles` to see available profile names.
 
 **Installation Scopes:**
 
