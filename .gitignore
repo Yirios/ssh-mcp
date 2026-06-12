@@ -137,6 +137,11 @@ dist
 
 # Ignore build output
 build/
+src/index.ts.bak-sdk-1.29
 
 # Local SSH MCP profile configs
 profiles/
+
+# Running agent data
+docs/
+scripts/
