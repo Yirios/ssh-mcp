@@ -2,7 +2,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
-import { Client, ClientChannel } from 'ssh2';
+import { Client, ClientChannel, SFTPWrapper } from 'ssh2';
 import { z } from 'zod';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { readFileSync, readdirSync, statSync } from 'fs';
@@ -41,6 +41,20 @@ const KEY = argvConfig.key;
 const PROFILES_FILE = argvConfig.profiles || process.env.SSH_MCP_PROFILES;
 const PROFILES_DIR = argvConfig.profilesDir || process.env.SSH_MCP_PROFILES_DIR;
 const DEFAULT_TIMEOUT = argvConfig.timeout ? parseInt(argvConfig.timeout) : 60000; // 60 seconds default timeout
+const DEFAULT_MAX_FILE_SIZE = 10 * 1024 * 1024;
+const MAX_FILE_SIZE_RAW = argvConfig.maxFileSize;
+export function parseMaxFileSize(value: string | null | undefined): number {
+  if (typeof value === 'string') {
+    const lowered = value.toLowerCase();
+    if (lowered === 'none') return Infinity;
+    const parsed = parseInt(value);
+    if (isNaN(parsed)) return DEFAULT_MAX_FILE_SIZE;
+    if (parsed <= 0) return Infinity;
+    return parsed;
+  }
+  return DEFAULT_MAX_FILE_SIZE;
+}
+const MAX_FILE_SIZE = parseMaxFileSize(MAX_FILE_SIZE_RAW);
 // Max characters configuration:
 // - Default: 1000 characters
 // - When set via --maxChars:
@@ -485,6 +499,19 @@ export class SSHConnectionManager {
     return this.suPromise;
   }
 
+  getSftp(): Promise<SFTPWrapper> {
+    const conn = this.getConnection();
+    return new Promise((resolve, reject) => {
+      conn.sftp((err: Error | undefined, sftp: SFTPWrapper) => {
+        if (err) {
+          reject(new McpError(ErrorCode.InternalError, `SFTP session error: ${err.message}`));
+          return;
+        }
+        resolve(sftp);
+      });
+    });
+  }
+
   async ensureConnected(): Promise<void> {
     if (!this.isConnected()) {
       await this.connect();
@@ -631,6 +658,155 @@ if (!DISABLE_SUDO) {
     }
   );
 }
+
+export function validateRemotePath(remotePath: string): string {
+  if (typeof remotePath !== 'string' || !remotePath.trim()) {
+    throw new McpError(ErrorCode.InvalidParams, 'remotePath must be a non-empty string');
+  }
+
+  const trimmed = remotePath.trim();
+  if (!trimmed.startsWith('/')) {
+    throw new McpError(ErrorCode.InvalidParams, 'remotePath must be an absolute path (start with /)');
+  }
+  if (trimmed.includes('\0')) {
+    throw new McpError(ErrorCode.InvalidParams, 'remotePath cannot contain null bytes');
+  }
+
+  return trimmed;
+}
+
+server.registerTool(
+  "upload-file",
+  {
+    description: "Upload file content to a configured SSH profile via SFTP. Parent directories must already exist.",
+    inputSchema: {
+      remotePath: z.string().describe("Absolute path on the remote server where the file will be written"),
+      content: z.string().describe("File content as raw UTF-8 text or base64-encoded binary data"),
+      encoding: z.enum(["utf8", "base64"]).default("utf8").describe("Content encoding: utf8 for text files, base64 for binary files"),
+      profile: z.string().optional().describe("SSH profile name. Required when multiple profiles are configured"),
+    },
+  },
+  async ({ remotePath, content, encoding, profile }) => {
+    const validatedPath = validateRemotePath(remotePath);
+    const buffer = encoding === "base64"
+      ? Buffer.from(content, "base64")
+      : Buffer.from(content, "utf8");
+    let sftp: SFTPWrapper | undefined;
+
+    try {
+      const manager = await getConnectionManager(profile);
+      await manager.ensureConnected();
+      sftp = await manager.getSftp();
+
+      return await new Promise((resolve, reject) => {
+        let isResolved = false;
+        const timeoutId = setTimeout(() => {
+          if (!isResolved) {
+            isResolved = true;
+            reject(new McpError(ErrorCode.InternalError, `Upload timed out after ${DEFAULT_TIMEOUT}ms`));
+          }
+        }, DEFAULT_TIMEOUT);
+
+        sftp!.writeFile(validatedPath, buffer, (err?: Error | null) => {
+          if (isResolved) return;
+          isResolved = true;
+          clearTimeout(timeoutId);
+
+          if (err) {
+            reject(new McpError(ErrorCode.InternalError, `SFTP write error: ${err.message}`));
+            return;
+          }
+
+          resolve({
+            content: [{
+              type: 'text' as const,
+              text: `Uploaded ${buffer.length} bytes to ${validatedPath}`,
+            }],
+          });
+        });
+      });
+    } catch (err: any) {
+      if (err instanceof McpError) throw err;
+      throw new McpError(ErrorCode.InternalError, `Unexpected error: ${err?.message || err}`);
+    } finally {
+      if (sftp) sftp.end();
+    }
+  }
+);
+
+server.registerTool(
+  "download-file",
+  {
+    description: "Download a file from a configured SSH profile via SFTP and return its content.",
+    inputSchema: {
+      remotePath: z.string().describe("Absolute path of the file to download from the remote server"),
+      encoding: z.enum(["utf8", "base64"]).default("utf8").describe("Output encoding: utf8 for text files, base64 for binary files"),
+      profile: z.string().optional().describe("SSH profile name. Required when multiple profiles are configured"),
+    },
+  },
+  async ({ remotePath, encoding, profile }) => {
+    const validatedPath = validateRemotePath(remotePath);
+    let sftp: SFTPWrapper | undefined;
+
+    try {
+      const manager = await getConnectionManager(profile);
+      await manager.ensureConnected();
+      sftp = await manager.getSftp();
+
+      if (Number.isFinite(MAX_FILE_SIZE)) {
+        const stats = await new Promise<{ size: number }>((resolve, reject) => {
+          sftp!.stat(validatedPath, (err: Error | undefined, stats: any) => {
+            if (err) {
+              reject(new McpError(ErrorCode.InternalError, `SFTP stat error: ${err.message}`));
+              return;
+            }
+            resolve(stats);
+          });
+        });
+
+        if (stats.size > MAX_FILE_SIZE) {
+          throw new McpError(
+            ErrorCode.InvalidParams,
+            `File size ${stats.size} bytes exceeds maximum allowed ${MAX_FILE_SIZE} bytes. Use --maxFileSize to increase or set to "none" to disable.`
+          );
+        }
+      }
+
+      return await new Promise((resolve, reject) => {
+        let isResolved = false;
+        const timeoutId = setTimeout(() => {
+          if (!isResolved) {
+            isResolved = true;
+            reject(new McpError(ErrorCode.InternalError, `Download timed out after ${DEFAULT_TIMEOUT}ms`));
+          }
+        }, DEFAULT_TIMEOUT);
+
+        sftp!.readFile(validatedPath, (err: Error | undefined, data: Buffer) => {
+          if (isResolved) return;
+          isResolved = true;
+          clearTimeout(timeoutId);
+
+          if (err) {
+            reject(new McpError(ErrorCode.InternalError, `SFTP read error: ${err.message}`));
+            return;
+          }
+
+          resolve({
+            content: [{
+              type: 'text' as const,
+              text: encoding === "base64" ? data.toString("base64") : data.toString("utf8"),
+            }],
+          });
+        });
+      });
+    } catch (err: any) {
+      if (err instanceof McpError) throw err;
+      throw new McpError(ErrorCode.InternalError, `Unexpected error: ${err?.message || err}`);
+    } finally {
+      if (sftp) sftp.end();
+    }
+  }
+);
 
 // New function that uses persistent connection
 export async function execSshCommandWithConnection(manager: SSHConnectionManager, command: string, stdin?: string): Promise<{ [x: string]: unknown; content: ({ [x: string]: unknown; type: "text"; text: string; } | { [x: string]: unknown; type: "image"; data: string; mimeType: string; } | { [x: string]: unknown; type: "audio"; data: string; mimeType: string; } | { [x: string]: unknown; type: "resource"; resource: any; })[] }> {

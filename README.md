@@ -40,6 +40,7 @@
 
 - MCP-compliant server exposing SSH capabilities
 - Execute shell commands on remote Linux and Windows systems
+- Upload and download files over SFTP
 - Secure authentication via password or SSH key
 - Built with TypeScript and the official MCP SDK
 - **Configurable timeout protection** with automatic process abortion
@@ -50,26 +51,49 @@
 - `exec`: Execute a shell command on the remote server
   - **Parameters:**
     - `command` (required): Shell command to execute on the remote SSH server
+    - `profile` (optional): SSH profile name. Required when multiple profiles are configured
     - `description` (optional): Optional description of what this command will do (appended as a comment)
   - **Timeout Configuration:**
 
 - `sudo-exec`: Execute a shell command with sudo elevation
   - **Parameters:**
     - `command` (required): Shell command to execute as root using sudo
+    - `profile` (optional): SSH profile name. Required when multiple profiles are configured
     - `description` (optional): Optional description of what this command will do (appended as a comment)
   - **Notes:**
     - Requires `--sudoPassword` to be set for password-protected sudo
     - Can be disabled by passing the `--disableSudo` flag at startup if sudo access is not needed or not available
     - For persistent root access, consider using `--suPassword` instead which establishes a root shell
     - Tool will not be available at all if server is started with `--disableSudo`
-  - **Timeout Configuration:**
-    - Timeout is configured via command line argument `--timeout` (in milliseconds)
-    - Default timeout: 60000ms (1 minute)
-    - When a command times out, the server automatically attempts to abort the running process before closing the connection
-  - **Max Command Length Configuration:**
-    - Max command characters are configured via `--maxChars`
-    - Default: `1000`
-    - No-limit mode: set `--maxChars=none` or any `<= 0` value (e.g. `--maxChars=0`)
+
+- `upload-file`: Upload file content to the remote server via SFTP
+  - **Parameters:**
+    - `remotePath` (required): Absolute destination path on the remote server
+    - `content` (required): Raw UTF-8 text or base64-encoded binary content
+    - `encoding` (optional): `utf8` (default) or `base64`
+    - `profile` (optional): SSH profile name. Required when multiple profiles are configured
+  - **Notes:**
+    - Parent directories must already exist
+    - Existing files are overwritten
+
+- `download-file`: Download a file from the remote server via SFTP
+  - **Parameters:**
+    - `remotePath` (required): Absolute source path on the remote server
+    - `encoding` (optional): `utf8` (default) or `base64`
+    - `profile` (optional): SSH profile name. Required when multiple profiles are configured
+  - **Notes:**
+    - File size is limited by `--maxFileSize` (default: 10485760 bytes)
+    - Use `--maxFileSize=none` or `--maxFileSize=0` to disable the limit
+
+- **Timeout Configuration:**
+  - Timeout is configured via command line argument `--timeout` (in milliseconds)
+  - Default timeout: 60000ms (1 minute)
+  - When a command times out, the server automatically attempts to abort the running process before closing the connection
+
+- **Max Command Length Configuration:**
+  - Max command characters are configured via `--maxChars`
+  - Default: `1000`
+  - No-limit mode: set `--maxChars=none` or any `<= 0` value (e.g. `--maxChars=0`)
 
 ## Installation
 
@@ -99,6 +123,7 @@ You can configure your IDE or LLM like Cursor, Windsurf, Claude Desktop to use t
 - `suPassword`: Password for su elevation (when you need a persistent root shell)
 - `timeout`: Command execution timeout in milliseconds (default: 60000ms = 1 minute)
 - `maxChars`: Maximum allowed characters for the `command` input (default: 1000). Use `none` or `0` to disable the limit.
+- `maxFileSize`: Maximum allowed `download-file` size in bytes (default: 10485760). Use `none` or `0` to disable the limit.
 - `disableSudo`: Flag to disable the `sudo-exec` tool completely. Useful when sudo access is not needed or not available.
 
 
@@ -117,7 +142,8 @@ You can configure your IDE or LLM like Cursor, Windsurf, Claude Desktop to use t
                 "--password=pass",
                 "--key=path/to/key",
                 "--timeout=30000",
-                "--maxChars=none"
+                "--maxChars=none",
+                "--maxFileSize=10485760"
             ]
         }
     }
@@ -228,4 +254,4 @@ This project follows a [Code of Conduct](./CODE_OF_CONDUCT.md) to ensure a welco
 
 ## Support
 
-If you find SSH MCP Server helpful, consider starring the repository or contributing! Pull requests and feedback are welcome. 
+If you find SSH MCP Server helpful, consider starring the repository or contributing! Pull requests and feedback are welcome.
